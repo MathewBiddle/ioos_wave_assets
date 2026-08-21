@@ -17,28 +17,61 @@
 # We can search for datasets reporting wave data in the last 30 days. We can return the unique coordinates for each dataset so we can build a map.
 
 
+import time
 from xmlrpc import server
-
 from erddapy import ERDDAP
+from erddapy.core.url import urlopen
 import folium
 import geopandas as gpd
 import pandas as pd
+import lxml
 
+## function to collect appropriate CF standard names
+def get_cf_std_name():
+    url = "https://cfconventions.org/Data/cf-standard-names/current/src/cf-standard-name-table.xml"
 
+    tbl_version = pd.read_xml(url, xpath="./*")["version_number"][0].astype(int)
+    df = pd.read_xml(url, xpath="entry")
 
-def get_sensor_map_data():
+    std_names = df.loc[
+        (df["id"].str.contains("sea_surface_wave_") | 
+         df["id"].str.contains("sea_surface_swell_") |
+         df["id"].str.contains("sea_surface_wind_wave_")
+         )
+    ]
+
+    print(f"CF Standard Name Table: {tbl_version}")
+
+    sensor_map_std_names = pd.read_csv('https://erddap.sensors.ioos.us/erddap/categorize/standard_name/index.csv')
+
+    refine_ctd_names = sensor_map_std_names.merge(std_names, left_on='Category', right_on='id')
+
+    print(f"Number of appropriate CF Standard Names in Sensor Map: {len(refine_ctd_names)}")
+    print(f"Appropriate CF Standard Names in Sensor Map:\n{refine_ctd_names['id'].tolist()}")   
+
+    return refine_ctd_names
+
+def get_sensor_map_data(std_names):
+
     server = "http://erddap.sensors.ioos.us/erddap"
     e = ERDDAP(server=server, protocol="tabledap")
 
-    kw = {
-        "min_time": "now-30days",
-        "search_for": "waves"
-    }
+    df_dsets_out = pd.DataFrame()
+    for std_name in std_names["id"].tolist():
+        kw = {
+            "min_time": "now-30days",
+            "standard_name": std_name,
+        }
 
-    url = e.get_search_url(response="csv", **kw)
-    df = pd.read_csv(url)
-    dataset_ids = df["Dataset ID"]
+        url = e.get_search_url(response="csv", **kw)
+        df_dsets = pd.read_csv(url)
+        #time.sleep(1)
+        df_dsets_out = pd.concat([df_dsets_out, df_dsets])
 
+
+    dataset_ids = sorted(set(df_dsets_out["Dataset ID"]))
+
+    ## get coords for each station
     e.variables = ["longitude", "latitude"]
     e.constraints = {
     "time>=": "now-30days",
@@ -46,35 +79,35 @@ def get_sensor_map_data():
     }
     kw = {"distinct": True}
 
-    df_out = pd.DataFrame()
+    sensor_gdf = gpd.GeoDataFrame()
     for dataset_id in dataset_ids:
         if 'glider' not in dataset_id:
             e.dataset_id = dataset_id
             try:
-                df = e.to_pandas(
-                    response="csvp",
+                # df = e.to_pandas(
+                #     response="csvp",
+                #     **kw
+                #     )
+                url = e.get_download_url(response="geoJson",
                     **kw
                     )
-                df['dataset_id'] = dataset_id
-                df['info_url'] = e.get_info_url(response="html")
-                df["href"] = [
-                    f'<a href="{url}" target="_blank">{url}</a>' for url in df["info_url"]
+                
+                gdf = gpd.read_file(urlopen(url))
+                gdf = gdf.explode(ignore_index=False)
+                #time.sleep(1)
+                gdf.set_crs(epsg=4326, inplace=True)
+
+                gdf['dataset_id'] = dataset_id
+                gdf['info_url'] = e.get_info_url(response="html")
+                gdf["href"] = [
+                    f'<a href="{url}" target="_blank">{url}</a>' for url in gdf["info_url"]
                     ]
             except:
                 print(f"{dataset_id} no valid data from {server}.")
 
 
-        df_out = pd.concat([df_out, df])
+        sensor_gdf = pd.concat([sensor_gdf, gdf])
 
-    # convert to geodataframe
-
-    sensor_gdf = gpd.GeoDataFrame(
-                    df_out,
-                    geometry=gpd.points_from_xy(
-                        df_out['longitude (degrees_east)'], df_out['latitude (degrees_north)']
-                    ),
-                    crs="epsg:4326",
-                )
     return sensor_gdf
 
 # Finally, we can make a map of the stations that have reported data in the last 30 days.
@@ -101,35 +134,30 @@ def get_hfradar_data():
     }
     kw = {"distinct": True}
 
-    df_out = pd.DataFrame()
+    hfr_gdf = gpd.GeoDataFrame()
     for dataset_id in dataset_ids:
         # skip the UPR_FRDO_hfr_wave dataset because coordinates are incorrect.
         if dataset_id != "UPR_FRDO_hfr_wave":
             e.dataset_id = dataset_id
             try:
-                df = e.to_pandas(
-                response="csvp",
-                **kw
-                )
-                df['dataset_id'] = dataset_id
-                df['info_url'] = e.get_info_url(response="html")
-                df["href"] = [
-                    f'<a href="{url}" target="_blank">{url}</a>' for url in df["info_url"]
+                url = e.get_download_url(response="geoJson",
+                    **kw
+                    )
+                
+                gdf = gpd.read_file(urlopen(url))
+                gdf = gdf.explode(ignore_index=False)
+                #time.sleep(1)
+                gdf.set_crs(epsg=4326, inplace=True)
+                gdf['dataset_id'] = dataset_id
+                gdf['info_url'] = e.get_info_url(response="html")
+                gdf["href"] = [
+                    f'<a href="{url}" target="_blank">{url}</a>' for url in gdf["info_url"]
                     ]
             except:
                 print(f"{dataset_id} no valid data from {server}.")
 
 
-        df_out = pd.concat([df_out, df])
-
-    # convert to geodataframe
-    hfr_gdf = gpd.GeoDataFrame(
-                    df_out,
-                    geometry=gpd.points_from_xy(
-                        df_out['longitude (degrees_east)'], df_out['latitude (degrees_north)']
-                    ),
-                    crs="epsg:4326",
-                )
+        hfr_gdf = pd.concat([hfr_gdf, gdf])
 
     return hfr_gdf
 
@@ -150,15 +178,21 @@ def get_asset_inventory_data():
     }
 
     e.dataset_id = "processed_asset_inventory"
-
-    asset_inventory_gdf = gpd.read_file(e.get_download_url(response="geoJson"))
+    url = e.get_download_url(response="geoJson")
+    asset_inventory_gdf = gpd.read_file(urlopen(url))
+    asset_inventory_gdf.set_crs(epsg=4326, inplace=True)
+    #asset_inventory_gdf = gpd.read_file(e.get_download_url(response="geoJson"))
     asset_inventory_gdf['info_url'] = e.get_info_url(response="html")
     asset_inventory_gdf["href"] = [
         f'<a href="{url}" target="_blank">{url}</a>' for url in asset_inventory_gdf["info_url"]
         ]
+    
     return asset_inventory_gdf
 
-sensor_gdf = get_sensor_map_data()
+## Cross check those standard names with what is actually in sensor map https://erddap.sensors.ioos.us/erddap/categorize/standard_name/index.csvp
+std_names = get_cf_std_name()
+sensor_gdf = get_sensor_map_data(std_names)
+
 cdip_gdf = sensor_gdf[sensor_gdf["dataset_id"].str.contains("cdip")]
 ndbc_gdf = sensor_gdf[sensor_gdf["dataset_id"].str.contains("ndbc")]
 sensor_gdf = sensor_gdf[(~sensor_gdf["dataset_id"].str.contains("ndbc") & ~sensor_gdf["dataset_id"].str.contains("cdip") & ~sensor_gdf["dataset_id"].str.contains("glider"))]
@@ -201,7 +235,7 @@ folium.raster_layers.TileLayer(
 # Add asset inventory to map
 folium.GeoJson(
     data=asset_inventory_gdf,
-    name="Asset Inventory",#.format(name),
+    name=f"Asset Inventory: {len(asset_inventory_gdf)}",#.format(name),
     marker=folium.CircleMarker(radius=1, color="green"),
     tooltip=folium.features.GeoJsonTooltip(
         fields=["station_long_name"],
@@ -217,7 +251,7 @@ folium.GeoJson(
 # Add sensor map to map
 folium.GeoJson(
     data=sensor_gdf,
-    name="RA Stations",#.format(name),
+    name=f"RA Stations: {len(sensor_gdf)}",#.format(name),
     marker=folium.CircleMarker(radius=5, color="red"),
     tooltip=folium.features.GeoJsonTooltip(
         fields=["dataset_id"],
@@ -233,7 +267,7 @@ folium.GeoJson(
 # Add sensor map to map
 folium.GeoJson(
     data=cdip_gdf,
-    name="CDIP Stations",#.format(name),
+    name=f"CDIP Stations: {len(cdip_gdf)}",#.format(name),
     marker=folium.CircleMarker(radius=5, color="orange"),
     tooltip=folium.features.GeoJsonTooltip(
         fields=["dataset_id"],
@@ -249,7 +283,7 @@ folium.GeoJson(
 # Add sensor map to map
 folium.GeoJson(
     data=ndbc_gdf,
-    name="NDBC Stations",#.format(name),
+    name=f"NDBC Stations: {len(ndbc_gdf)}",#.format(name),
     marker=folium.CircleMarker(radius=5, color="purple"),
     tooltip=folium.features.GeoJsonTooltip(
         fields=["dataset_id"],
@@ -265,7 +299,7 @@ folium.GeoJson(
 # Add hfr stations to map
 folium.GeoJson(
     data=hfr_gdf,
-    name="HFR Map",#.format(name),
+    name=f"HFR: {len(hfr_gdf)}",#.format(name),
     marker=folium.CircleMarker(radius=5, color="blue"),
     tooltip=folium.features.GeoJsonTooltip(
         fields=["dataset_id"],
